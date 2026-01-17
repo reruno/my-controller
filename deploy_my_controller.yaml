@@ -1,0 +1,59 @@
+# 1. Identity: The "User" the Pod logs in as
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-controller-sa
+---
+# 2. Permissions: What that User is allowed to do
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: my-controller-role
+rules:
+  # Allow "Get/List/Watch/Update" on Pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+# 3. Binding: Connecting the Identity to the Permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: my-controller-rb
+subjects:
+  - kind: ServiceAccount
+    name: my-controller-sa
+roleRef:
+  kind: Role
+  name: my-controller-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# 4. The Application: Running the container
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-controller
+  labels:
+    app: my-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-controller
+  template:
+    metadata:
+      labels:
+        app: my-controller
+    spec:
+      serviceAccountName: my-controller-sa
+      containers:
+        - name: manager
+          # CHANGE THIS to your actual image!
+          image: reruno/my-controller:latest 
+          imagePullPolicy: Always
+          env:
+            # Critical: Pass the namespace to the Go code
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
