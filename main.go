@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	StartCheckTimeAnnotation = "mycontrollercheck/startchecktime"
-	EndCheckTimeAnnotation   = "mycontrollercheck/endchecktime"
-	CheckNumAnnotaions       = "mycontrollercheck/checknum"
+	CheckTimeStartAnnotation  = "mycontrollercheck/checktimestart"
+	CheckTimeEndAnnotation    = "mycontrollercheck/checktimeend"
+	CheckTimeUpdateAnnotation = "mycontrollercheck/checktimeupdate"
+	CheckNumAnnotaion         = "mycontrollercheck/checknum"
 )
 
 type PodReconciler struct {
@@ -27,40 +28,106 @@ type PodReconciler struct {
 }
 
 func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := ctrl.Log.WithName("reconciler")
+	log := ctrl.Log.WithName("reconciler").WithValues("pod", req.NamespacedName)
 
-	// 1. Fetch the Pod
+	log.Info("Starting reconcile loop")
+
 	var pod corev1.Pod
 	if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "Failed to fetch Pod")
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	var ok bool
-	if _, ok = pod.Annotations[EndCheckTimeAnnotation]; ok {
-		return ctrl.Result{}, nil
-	}
-	var checknum int = 0
-	if strNum, ok := pod.Annotations[CheckNumAnnotaions]; ok {
-		num, err := strconv.Atoi(strNum)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		checknum = num
-		checknum++
-		pod.Annotations[CheckNumAnnotaions] = fmt.Sprintf("%d", checknum)
-	} else {
-		pod.Annotations[StartCheckTimeAnnotation] = time.Now().Format(time.RFC3339)
-		checknum = 1
-		pod.Annotations[CheckNumAnnotaions] = fmt.Sprintf("%d", checknum)
+
+	if pod.Annotations == nil {
+		log.Info("Annotations were nil, initializing map")
+		pod.Annotations = map[string]string{}
 	}
 
-	if checknum >= 100 {
-		pod.Annotations[EndCheckTimeAnnotation] = time.Now().Format(time.RFC3339)
-		r.Update(ctx, &pod)
+	if _, ok := pod.Annotations[CheckTimeEndAnnotation]; ok {
+		log.Info("Skipping reconcile: CheckTimeEndAnnotation present")
 		return ctrl.Result{}, nil
+	}
+
+	patch := client.MergeFrom(pod.DeepCopy())
+
+	timeStr, ok := pod.Annotations[CheckTimeUpdateAnnotation]
+	if !ok {
+		now := time.Now()
+		log.Info("First run detected. Initializing annotations.", "start_time", now.Format(time.RFC3339))
+
+		pod.Annotations[CheckTimeUpdateAnnotation] = now.Format(time.RFC3339)
+		pod.Annotations[CheckTimeStartAnnotation] = now.Format(time.RFC3339)
+		pod.Annotations[CheckNumAnnotaion] = "0"
+
+		if err := r.Patch(ctx, &pod, patch); err != nil {
+			log.Error(err, "Failed to patch initial annotations")
+			return ctrl.Result{}, err
+		}
+		log.Info("Successfully initialized pod")
+		return ctrl.Result{}, nil
+	}
+
+	updateTime, err := time.Parse(time.RFC3339, timeStr)
+	if err != nil {
+		log.Error(err, "Failed to parse update time", "malformed_value", timeStr)
+		return ctrl.Result{}, err
+	}
+
+	nextUpdateTime := updateTime.Add(time.Second)
+	now := time.Now()
+	delta := nextUpdateTime.Sub(now)
+
+	log.Info("Calculated timing",
+		"last_update", updateTime.Format(time.RFC3339),
+		"next_target", nextUpdateTime.Format(time.RFC3339),
+		"current_time", now.Format(time.RFC3339),
+		"delta_ms", delta.Milliseconds(),
+	)
+
+	if delta <= 0 {
+		numStr, ok := pod.Annotations[CheckNumAnnotaion]
+		if ok {
+			checknum, err := strconv.Atoi(numStr)
+			if err != nil {
+				log.Error(err, "Failed to parse checknum", "malformed_value", numStr)
+				return ctrl.Result{}, err
+			}
+
+			if checknum >= 120 {
+				log.Info("Target count reached (120). Marking complete.")
+				pod.Annotations[CheckTimeEndAnnotation] = now.Format(time.RFC3339)
+
+				if err := r.Patch(ctx, &pod, patch); err != nil {
+					log.Error(err, "Failed to patch completion annotation")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+
+			oldNum := checknum
+			checknum++
+			log.Info("Incrementing counter", "from", oldNum, "to", checknum)
+
+			pod.Annotations[CheckNumAnnotaion] = fmt.Sprintf("%d", checknum)
+			pod.Annotations[CheckTimeUpdateAnnotation] = now.Format(time.RFC3339)
+
+			if err = r.Patch(ctx, &pod, patch); err != nil {
+				log.Error(err, "Failed to patch update")
+				return ctrl.Result{}, err
+			}
+			log.Info("Successfully patched update")
+			return ctrl.Result{}, nil
+
+		} else {
+			err := fmt.Errorf("inconsistent state: time exists but number missing")
+			log.Error(err, "Cannot proceed")
+			return ctrl.Result{}, nil
+		}
 	} else {
-		log.Info("Checks are done", "pod", pod.Name)
-		r.Update(ctx, &pod)
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		log.Info("Throttling: Waiting for next slot", "requeue_after", delta.String())
+		return ctrl.Result{RequeueAfter: delta}, nil
 	}
 }
 
@@ -95,10 +162,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	err = (&PodReconciler{
+
+	podReconciler := &PodReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr)
+	}
+	err = podReconciler.SetupWithManager(mgr)
 	if err != nil {
 		panic(err)
 	}
